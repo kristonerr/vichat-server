@@ -128,7 +128,7 @@ app.get('/api/me', async (req, res) => {
 });
 
 app.get('/api/version', (req, res) => {
-  res.json({ versionCode: 10, versionName: '0.5.6', apkUrl: '/apk/vichat.apk', changelog: '- Security fixes\n- MutableSharedFlow\n- EncryptedSharedPreferences\n- UTC timestamps' });
+  res.json({ versionCode: 11, versionName: '0.5.7', apkUrl: '/apk/vichat.apk', changelog: '- PostgreSQL migration\n- Data persistence across rebuilds\n- v0.5.7 APK' });
 });
 
 app.use('/apk', express.static(path.join(__dirname, 'apk')));
