@@ -127,6 +127,12 @@ app.get('/api/me', (req, res) => {
   res.json(user);
 });
 
+app.get('/api/version', (req, res) => {
+  res.json({ versionCode: 10, versionName: '0.5.6', apkUrl: '/apk/vichat.apk', changelog: '- Security fixes\n- MutableSharedFlow\n- EncryptedSharedPreferences\n- UTC timestamps' });
+});
+
+app.use('/apk', express.static(path.join(__dirname, 'apk')));
+
 app.put('/api/messages/:id/edit', (req, res) => {
   const user = getUserByToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'not authorized' });
