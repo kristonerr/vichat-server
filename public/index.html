@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ViChat</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',Tahoma,sans-serif}
+body{background:linear-gradient(135deg,#667eea,#764ba2);height:100vh;display:flex;align-items:center;justify-content:center}
+.auth-screen{background:#fff;border-radius:16px;padding:32px;width:360px;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.auth-screen h1{text-align:center;font-size:24px;color:#333;margin-bottom:4px}
+.auth-screen .sub{text-align:center;color:#aaa;font-size:13px;margin-bottom:20px}
+.tabs{display:flex;gap:0;margin-bottom:16px;border-radius:10px;overflow:hidden;border:1px solid #e0e0e0}
+.tab{flex:1;padding:8px;text-align:center;cursor:pointer;font-size:14px;background:#f5f5f5;border:none;transition:.2s}
+.tab.active{background:#667eea;color:#fff}
+.auth-input{width:100%;padding:10px 14px;border:2px solid #e0e0e0;border-radius:10px;font-size:14px;outline:none;transition:.2s;margin-bottom:10px}
+.auth-input:focus{border-color:#667eea}
+.auth-btn{width:100%;padding:11px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border:none;border-radius:10px;font-size:15px;cursor:pointer;transition:.2s}
+.auth-btn:hover{transform:translateY(-1px);box-shadow:0 8px 25px rgba(102,126,234,.4)}
+.auth-error{color:#ff4757;font-size:13px;text-align:center;margin-top:8px;min-height:20px}
+.chat-screen{display:none;width:860px;height:600px;background:#fff;border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.3);overflow:hidden}
+.chat-layout{display:flex;height:100%}
+.sidebar{width:270px;background:#f8f9fc;border-right:1px solid #e8e8e8;display:flex;flex-direction:column}
+.sidebar-header{padding:14px 16px;border-bottom:1px solid #e8e8e8;display:flex;justify-content:space-between;align-items:center}
+.sidebar-header h2{font-size:15px}
+.contacts-list{flex:1;overflow-y:auto;padding:8px}
+.contact-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:10px;cursor:pointer;transition:.2s;margin-bottom:2px}
+.contact-item:hover{background:#eef0f7}
+.contact-item.active{background:#e8ecf8}
+.contact-avatar{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:bold;font-size:13px;flex-shrink:0}
+.contact-info{flex:1;min-width:0}
+.contact-name{font-size:14px;font-weight:500;color:#333}
+.contact-status{font-size:11px}
+.contact-status.online{color:#4CAF50}
+.contact-status.offline{color:#bbb}
+.main{flex:1;display:flex;flex-direction:column}
+.chat-header{padding:14px 20px;border-bottom:1px solid #e8e8e8;display:flex;align-items:center;gap:10px;justify-content:space-between}
+.chat-header-left{display:flex;align-items:center;gap:10px}
+.add-contact-btn{background:#e8ecf8;border:none;border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;color:#667eea;transition:.2s}
+.add-contact-btn:hover{background:#d5dbf0}
+.messages{flex:1;overflow-y:auto;padding:16px 20px;display:flex;flex-direction:column;gap:6px;background:#fafafa}
+.msg{max-width:75%;padding:9px 14px;border-radius:14px;font-size:14px;line-height:1.4;word-wrap:break-word}
+.msg.self{align-self:flex-end;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border-bottom-right-radius:4px}
+.msg.other{align-self:flex-start;background:#fff;color:#333;border:1px solid #e8e8e8;border-bottom-left-radius:4px}
+.msg .time{font-size:10px;opacity:.6;margin-top:3px;text-align:right}
+.msg .uname{font-size:11px;font-weight:600;margin-bottom:2px}
+.input-area{padding:10px 16px;border-top:1px solid #e8e8e8;display:flex;gap:8px;background:#fff}
+.input-area input{flex:1;padding:9px 14px;border:2px solid #e0e0e0;border-radius:10px;font-size:14px;outline:none}
+.input-area input:focus{border-color:#667eea}
+.input-area button{padding:9px 20px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border:none;border-radius:10px;cursor:pointer;font-size:14px}
+.typing-indicator{font-size:12px;color:#888;padding:2px 20px;height:18px}
+.no-chat{flex:1;display:flex;align-items:center;justify-content:center;color:#ccc;font-size:15px;flex-direction:column;gap:6px;background:#fafafa}
+.no-chat span{font-size:36px}
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#ddd;border-radius:3px}
+.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.4);z-index:100;align-items:center;justify-content:center}
+.modal{background:#fff;border-radius:16px;padding:24px;width:340px;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.modal h3{margin-bottom:12px;font-size:16px}
+.modal input{width:100%;padding:10px 14px;border:2px solid #e0e0e0;border-radius:10px;font-size:14px;outline:none;margin-bottom:10px}
+.modal input:focus{border-color:#667eea}
+.modal-btns{display:flex;gap:8px}
+.modal-btns button{flex:1;padding:9px;border-radius:10px;font-size:14px;cursor:pointer;border:none}
+.modal-btns .ok{background:#667eea;color:#fff}
+.modal-btns .cancel{background:#f0f0f0;color:#333}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:10px 20px;border-radius:10px;font-size:13px;z-index:200;opacity:0;transition:.3s}
+.toast.show{opacity:1}
+</style>
+</head>
+<body>
+
+<div class="auth-screen" id="authScreen">
+  <h1>💬 ViChat</h1>
+  <p class="sub">только для своих</p>
+  <div class="tabs">
+    <button class="tab active" onclick="switchAuthTab('login')" id="tabLogin">Вход</button>
+    <button class="tab" onclick="switchAuthTab('register')" id="tabRegister">Регистрация</button>
+  </div>
+  <div id="authError" class="auth-error"></div>
+  <input type="text" class="auth-input" id="authUsername" placeholder="Имя" maxlength="20" autofocus>
+  <input type="password" class="auth-input" id="authPassword" placeholder="Пароль" maxlength="50">
+  <button class="auth-btn" onclick="doAuth()" id="authBtn">Войти</button>
+</div>
+
+<div class="chat-screen" id="chatScreen">
+  <div class="chat-layout">
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <h2>💬 <span id="contactCount">0</span></h2>
+        <button class="add-contact-btn" onclick="showAddContact()">+</button>
+      </div>
+      <div class="contacts-list" id="contactsList"></div>
+      <div style="padding:8px;border-top:1px solid #e8e8e8;text-align:center">
+        <button onclick="logout()" style="background:none;border:none;color:#aaa;font-size:12px;cursor:pointer">Выйти</button>
+      </div>
+    </div>
+    <div class="main">
+      <div class="chat-header" id="chatHeader">
+        <div class="chat-header-left">
+          <span class="hint" id="chatHint">👈 Выбери собеседника</span>
+        </div>
+      </div>
+      <div class="messages" id="messages">
+        <div class="no-chat" id="noChat">
+          <span>💬</span>
+          <span id="noChatText">Выбери собеседника слева</span>
+        </div>
+      </div>
+      <div class="typing-indicator" id="typingIndicator"></div>
+      <div class="input-area" id="inputArea" style="display:none">
+        <input type="text" id="messageInput" placeholder="Напиши..." maxlength="500">
+        <button onclick="sendMessage()">➤</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="addContactModal">
+  <div class="modal">
+    <h3>➕ Добавить контакт</h3>
+    <input type="text" id="addContactInput" placeholder="Имя пользователя" maxlength="20">
+    <div class="modal-btns">
+      <button class="cancel" onclick="closeModal()">Отмена</button>
+      <button class="ok" onclick="addContact()">Добавить</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const api = (method, path, body) => fetch(path, {
+  method,
+  headers: { 'Content-Type': 'application/json', 'Authorization': localStorage.getItem('token') || '' },
+  body: body ? JSON.stringify(body) : undefined
+}).then(r => r.json());
+
+let myId = null, myUsername = null, myColor = null;
+let contacts = {}, onlineIds = new Set();
+let selectedContactId = null;
+let socket = null;
+
+function switchAuthTab(tab) {
+  document.getElementById('tabLogin').className = tab === 'login' ? 'tab active' : 'tab';
+  document.getElementById('tabRegister').className = tab === 'register' ? 'tab active' : 'tab';
+  document.getElementById('authBtn').textContent = tab === 'login' ? 'Войти' : 'Зарегистрироваться';
+  document.getElementById('authError').textContent = '';
+}
+
+async function doAuth() {
+  const username = document.getElementById('authUsername').value.trim();
+  const password = document.getElementById('authPassword').value.trim();
+  const isLogin = document.getElementById('tabLogin').classList.contains('active');
+  if (!username || !password) return setError('Заполни все поля');
+
+  const path = isLogin ? '/api/login' : '/api/register';
+  const res = await api('POST', path, { username, password });
+  if (res.error) return setError(res.error);
+
+  localStorage.setItem('token', res.token);
+  localStorage.setItem('username', username);
+  startChat(res.user);
+}
+
+function setError(msg) {
+  document.getElementById('authError').textContent = msg;
+}
+
+function startChat(user) {
+  myId = user.id;
+  myUsername = user.username;
+  myColor = user.color;
+  document.getElementById('authScreen').style.display = 'none';
+  document.getElementById('chatScreen').style.display = 'block';
+  connectSocket();
+  loadContacts();
+}
+
+function connectSocket() {
+  socket = io({ auth: { token: localStorage.getItem('token') } });
+
+  socket.on('connect_error', () => {
+    toast('Ошибка соединения с сервером');
+  });
+
+  socket.on('contacts-online', (list) => {
+    onlineIds = new Set(list.map(u => u.id));
+    renderContacts();
+  });
+
+  socket.on('private-message', (msg) => {
+    const partnerId = msg.fromId === myId ? selectedContactId : msg.fromId;
+    if (!contacts[partnerId]) return;
+    if (!contacts[partnerId].messages) contacts[partnerId].messages = [];
+    contacts[partnerId].messages.push(msg);
+    if (selectedContactId === partnerId) {
+      renderMessages(partnerId);
+    } else if (msg.fromId !== myId) {
+      contacts[partnerId].hasUnread = true;
+      renderContacts();
+    }
+  });
+
+  socket.on('typing', ({ fromUsername }) => {
+    document.getElementById('typingIndicator').textContent = fromUsername + ' печатает...';
+  });
+
+  socket.on('stop-typing', () => {
+    document.getElementById('typingIndicator').textContent = '';
+  });
+}
+
+async function loadContacts() {
+  const list = await api('GET', '/api/contacts');
+  contacts = {};
+  list.forEach(c => { contacts[c.id] = c; contacts[c.id].messages = []; });
+  renderContacts();
+  if (list.length === 0) {
+    document.getElementById('noChat').style.display = 'flex';
+    document.getElementById('noChatText').textContent = 'Нажми + чтобы добавить собеседника';
+  }
+}
+
+function renderContacts() {
+  const entries = Object.values(contacts);
+  document.getElementById('contactCount').textContent = entries.length;
+  if (entries.length === 0) {
+    document.getElementById('contactsList').innerHTML = '<div style="padding:20px;text-align:center;color:#aaa;font-size:13px">Контактов пока нет</div>';
+    return;
+  }
+  document.getElementById('contactsList').innerHTML = entries.map(c => {
+    const active = selectedContactId === c.id ? 'active' : '';
+    const online = onlineIds.has(c.id);
+    const initials = c.username.charAt(0).toUpperCase();
+    const status = online ? '<div class="contact-status online">🟢 online</div>' : '<div class="contact-status offline">offline</div>';
+    const unread = c.hasUnread ? '<span style="background:#ff4757;color:#fff;font-size:10px;padding:1px 6px;border-radius:10px;margin-left:auto">•</span>' : '';
+    return `<div class="contact-item ${active}" onclick="selectContact(${c.id})">
+      <div class="contact-avatar" style="background:${c.color}">${initials}</div>
+      <div class="contact-info"><div class="contact-name">${c.username}</div>${status}</div>
+      ${unread}</div>`;
+  }).join('');
+}
+
+async function selectContact(id) {
+  selectedContactId = id;
+  if (contacts[id]) contacts[id].hasUnread = false;
+  renderContacts();
+
+  const c = contacts[id];
+  document.getElementById('chatHint').innerHTML = `<div class="contact-avatar" style="background:${c.color};width:26px;height:26px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-size:11px">${c.username.charAt(0).toUpperCase()}</div> <strong>${c.username}</strong>`;
+  document.getElementById('inputArea').style.display = 'flex';
+  document.getElementById('messageInput').focus();
+  document.getElementById('typingIndicator').textContent = '';
+
+  if (!contacts[id].messages || contacts[id].messages.length === 0) {
+    const msgs = await api('GET', `/api/messages/${id}`);
+    contacts[id].messages = msgs.map(m => ({ fromId: m.fromId, text: m.text, time: m.time }));
+  }
+  renderMessages(id);
+}
+
+function renderMessages(contactId) {
+  const msgs = contacts[contactId]?.messages || [];
+  const el = document.getElementById('messages');
+  const noChat = document.getElementById('noChat');
+
+  el.querySelectorAll('.msg').forEach(e => e.remove());
+  noChat.style.display = msgs.length === 0 ? 'flex' : 'none';
+  if (msgs.length === 0) {
+    document.getElementById('noChatText').textContent = 'Напиши первое сообщение';
+    return;
+  }
+  msgs.forEach(m => {
+    const isSelf = m.fromId === myId;
+    const div = document.createElement('div');
+    div.className = `msg ${isSelf ? 'self' : 'other'}`;
+    if (!isSelf && contacts[contactId]) {
+      div.innerHTML = `<div class="uname" style="color:${contacts[contactId].color}">${contacts[contactId].username}</div>`;
+    }
+    div.innerHTML += `${m.text}<div class="time">${m.time || ''}</div>`;
+    el.appendChild(div);
+  });
+  el.scrollTop = el.scrollHeight;
+}
+
+function sendMessage() {
+  const text = document.getElementById('messageInput').value.trim();
+  if (!text || !selectedContactId) return;
+  socket.emit('private-message', { toUserId: selectedContactId, text });
+  document.getElementById('messageInput').value = '';
+  socket.emit('stop-typing', { toUserId: selectedContactId });
+}
+
+document.getElementById('messageInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendMessage();
+});
+
+let typingTimer;
+document.getElementById('messageInput').addEventListener('input', () => {
+  if (!selectedContactId) return;
+  socket.emit('typing', { toUserId: selectedContactId });
+  clearTimeout(typingTimer);
+  typingTimer = setTimeout(() => socket.emit('stop-typing', { toUserId: selectedContactId }), 1500);
+});
+
+function showAddContact() {
+  document.getElementById('addContactModal').style.display = 'flex';
+  document.getElementById('addContactInput').value = '';
+  document.getElementById('addContactInput').focus();
+}
+
+function closeModal() {
+  document.getElementById('addContactModal').style.display = 'none';
+}
+
+async function addContact() {
+  const username = document.getElementById('addContactInput').value.trim();
+  if (!username) return;
+  const res = await api('POST', '/api/contacts/add', { username });
+  if (res.error) return toast(res.error);
+  closeModal();
+  const list = await api('GET', '/api/contacts');
+  contacts = {};
+  list.forEach(c => { contacts[c.id] = c; contacts[c.id].messages = []; });
+  renderContacts();
+  toast('➕ ' + username + ' добавлен');
+}
+
+document.getElementById('addContactInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') addContact();
+});
+
+async function logout() {
+  await api('POST', '/api/logout');
+  localStorage.removeItem('token');
+  localStorage.removeItem('username');
+  if (socket) socket.close();
+  document.getElementById('chatScreen').style.display = 'none';
+  document.getElementById('authScreen').style.display = 'block';
+  document.getElementById('authPassword').value = '';
+}
+
+let toastTimer;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.className = 'toast', 2500);
+}
+
+document.getElementById('authPassword').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') doAuth();
+});
+
+const savedToken = localStorage.getItem('token');
+if (savedToken) {
+  api('GET', '/api/me').then(user => {
+    if (user && user.id) {
+      startChat(user);
+    }
+  }).catch(() => {
+    localStorage.removeItem('token');
+    localStorage.removeItem('username');
+  });
+}
+</script>
+</body>
+</html>

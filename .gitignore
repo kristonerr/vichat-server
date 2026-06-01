@@ -1,0 +1,5 @@
+node_modules/
+vica.db
+vica.db-shm
+vica.db-wal
+.env
