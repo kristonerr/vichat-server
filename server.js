@@ -4,19 +4,29 @@ const path = require('path');
 const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
+const multer = require('multer');
 const { pool, initDB } = require('./db');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96E6A1', '#DDA0DD', '#FFD93D', '#FF8C42', '#6C5CE7'];
 const authAttempts = new Map();
 const onlineUsers = new Map();
 const lastOnline = new Map();
+
+const avatarStorage = multer.diskStorage({
+  destination: path.join(__dirname, 'avatars'),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname) || '.jpg';
+    cb(null, `${req.userId}${ext}`);
+  }
+});
+const upload = multer({ storage: avatarStorage, limits: { fileSize: 2 * 1024 * 1024 } });
 
 function checkRateLimit(ip, maxAttempts) {
   const now = Date.now();
@@ -31,7 +41,7 @@ function checkRateLimit(ip, maxAttempts) {
 }
 
 async function getUserByToken(token) {
-  const result = await pool.query(`SELECT users.id, users.username, users.color FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = $1`, [token]);
+  const result = await pool.query(`SELECT users.id, users.username, users.color, users.avatar_url FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = $1`, [token]);
   return result.rows[0] || null;
 }
 
@@ -57,7 +67,7 @@ app.post('/api/register', async (req, res) => {
   const entry = authAttempts.get(ip);
   if (entry) entry.count = 0;
 
-  res.json({ token, user: { id: newUser.rows[0].id, username, color } });
+  res.json({ token, user: { id: newUser.rows[0].id, username, color, avatarUrl: null } });
 });
 
 app.post('/api/login', async (req, res) => {
@@ -82,7 +92,7 @@ app.post('/api/login', async (req, res) => {
   await pool.query('INSERT INTO sessions (user_id, token) VALUES ($1, $2)', [user.id, token]);
   authAttempts.set(ip, { count: 0, lastAttempt: Date.now() });
 
-  res.json({ token, user: { id: user.id, username: user.username, color: user.color } });
+  res.json({ token, user: { id: user.id, username: user.username, color: user.color, avatarUrl: user.avatar_url || null } });
 });
 
 app.post('/api/logout', async (req, res) => {
@@ -94,16 +104,17 @@ app.post('/api/logout', async (req, res) => {
 app.get('/api/contacts', async (req, res) => {
   const user = await getUserByToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'not authorized' });
-  const contacts = await pool.query(`SELECT u.id, u.username, u.color,
+  const contacts = await pool.query(`SELECT u.id, u.username, u.color, u.avatar_url,
     (SELECT COUNT(*) FROM messages m WHERE m.from_user_id = u.id AND m.to_user_id = $1 AND m.read_at IS NULL) as unread
     FROM contacts c JOIN users u ON u.id = c.contact_id WHERE c.user_id = $2`, [user.id, user.id]);
-  res.json(contacts.rows);
+  const rows = contacts.rows.map(r => ({ ...r, avatarUrl: r.avatar_url || null }));
+  res.json(rows);
 });
 
 app.post('/api/contacts/add', async (req, res) => {
   const user = await getUserByToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'not authorized' });
-  const contact = await pool.query('SELECT id FROM users WHERE username = $1', [req.body.username]);
+  const contact = await pool.query('SELECT id, username, color, avatar_url FROM users WHERE username = $1', [req.body.username]);
   if (!contact.rows[0]) return res.status(404).json({ error: 'Пользователь не найден' });
   if (contact.rows[0].id === user.id) return res.status(400).json({ error: 'Нельзя добавить себя' });
   try {
@@ -124,11 +135,64 @@ app.post('/api/contacts/remove', async (req, res) => {
 app.get('/api/me', async (req, res) => {
   const user = await getUserByToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'not authorized' });
-  res.json(user);
+  res.json({ ...user, avatarUrl: user.avatar_url || null });
+});
+
+app.post('/api/change-password', async (req, res) => {
+  const user = await getUserByToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'not authorized' });
+  const { oldPassword, newPassword } = req.body;
+  if (!oldPassword || !newPassword || newPassword.length < 4) {
+    return res.status(400).json({ error: 'Новый пароль от 4 символов' });
+  }
+  const fullUser = await pool.query('SELECT * FROM users WHERE id = $1', [user.id]);
+  if (!bcrypt.compareSync(oldPassword, fullUser.rows[0].password_hash)) {
+    return res.status(403).json({ error: 'Неверный текущий пароль' });
+  }
+  const hash = bcrypt.hashSync(newPassword, 10);
+  await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, user.id]);
+  res.json({ ok: true });
+});
+
+app.delete('/api/account', async (req, res) => {
+  const token = req.headers.authorization;
+  const user = await getUserByToken(token);
+  if (!user) return res.status(401).json({ error: 'not authorized' });
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: 'Введите пароль для подтверждения' });
+  const fullUser = await pool.query('SELECT * FROM users WHERE id = $1', [user.id]);
+  if (!bcrypt.compareSync(password, fullUser.rows[0].password_hash)) {
+    return res.status(403).json({ error: 'Неверный пароль' });
+  }
+  await pool.query('DELETE FROM sessions WHERE user_id = $1', [user.id]);
+  await pool.query('DELETE FROM users WHERE id = $1', [user.id]);
+  res.json({ ok: true });
+});
+
+app.post('/api/upload-avatar', async (req, res) => {
+  const user = await getUserByToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'not authorized' });
+  req.userId = user.id;
+  upload.single('avatar')(req, res, async (err) => {
+    if (err) return res.status(400).json({ error: err.message });
+    if (!req.file) return res.status(400).json({ error: 'Файл не загружен' });
+    const avatarUrl = `/api/avatar/${user.id}${path.extname(req.file.originalname) || '.jpg'}`;
+    await pool.query('UPDATE users SET avatar_url = $1 WHERE id = $2', [avatarUrl, user.id]);
+    res.json({ avatarUrl });
+  });
+});
+
+app.get('/api/avatar/:userId', async (req, res) => {
+  const userId = parseInt(req.params.userId);
+  const result = await pool.query('SELECT avatar_url FROM users WHERE id = $1', [userId]);
+  if (!result.rows[0] || !result.rows[0].avatar_url) return res.status(404).json({ error: 'no avatar' });
+  const filePath = path.join(__dirname, 'avatars', path.basename(result.rows[0].avatar_url));
+  res.sendFile(filePath, err => { if (err) res.status(404).json({ error: 'not found' }); });
 });
 
 app.get('/api/version', (req, res) => {
-  res.json({ versionCode: 11, versionName: '0.5.7', apkUrl: '/apk/vichat.apk', changelog: '- PostgreSQL migration\n- Data persistence across rebuilds\n- v0.5.7 APK' });
+  const base = `${req.protocol}://${req.get('host')}`;
+  res.json({ versionCode: 12, versionName: '0.6.0', apkUrl: `${base}/apk/vichat.apk`, changelog: '- Аватарки\n- Ответ на сообщения (reply)\n- Смена пароля\n- Удаление аккаунта' });
 });
 
 app.use('/apk', express.static(path.join(__dirname, 'apk')));
@@ -166,10 +230,22 @@ app.get('/api/messages/:contactId', async (req, res) => {
   if (!user) return res.status(401).json({ error: 'not authorized' });
   const contactId = parseInt(req.params.contactId);
   await pool.query('UPDATE messages SET read_at = NOW() WHERE from_user_id = $1 AND to_user_id = $2 AND read_at IS NULL', [contactId, user.id]);
-  const msgs = await pool.query(`SELECT m.id, m.text, m.from_user_id as fromId, m.created_at as time, m.read_at as readAt FROM messages m
+  const msgs = await pool.query(`SELECT m.id, m.text, m.from_user_id as fromId, m.created_at as time, m.read_at as readAt, m.reply_to_id as replyToId FROM messages m
     WHERE (m.from_user_id = $1 AND m.to_user_id = $2) OR (m.from_user_id = $3 AND m.to_user_id = $4)
     ORDER BY m.created_at ASC LIMIT 200`, [user.id, contactId, contactId, user.id]);
-  res.json(msgs.rows);
+  const rows = msgs.rows;
+  const replyIds = rows.filter(r => r.replyToId).map(r => r.replyToId);
+  if (replyIds.length > 0) {
+    const replied = await pool.query('SELECT id, text, from_user_id as fromId FROM messages WHERE id = ANY($1::int[])', [replyIds]);
+    const replyMap = {};
+    for (const r of replied.rows) replyMap[r.id] = r;
+    for (const row of rows) {
+      if (row.replyToId && replyMap[row.replyToId]) {
+        row.replyTo = replyMap[row.replyToId];
+      }
+    }
+  }
+  res.json(rows);
 });
 
 io.use(async (socket, next) => {
@@ -188,20 +264,29 @@ io.on('connection', (socket) => {
 
   const since = lastOnline.get(socket.userId) || 0;
   if (since) {
-    pool.query(`SELECT m.text, m.from_user_id as fromId, m.created_at as time FROM messages m
+    pool.query(`SELECT m.text, m.from_user_id as fromId, m.created_at as time, m.reply_to_id as replyToId FROM messages m
       WHERE m.to_user_id = $1 AND m.created_at > to_timestamp($2)
-      ORDER BY m.created_at ASC`, [socket.userId, since / 1000]).then(result => {
+      ORDER BY m.created_at ASC`, [socket.userId, since / 1000]).then(async (result) => {
       for (const msg of result.rows) {
+        if (msg.replyToId) {
+          const rep = await pool.query('SELECT id, text, from_user_id as fromId FROM messages WHERE id = $1', [msg.replyToId]);
+          if (rep.rows[0]) msg.replyTo = rep.rows[0];
+        }
         socket.emit('private-message', msg);
       }
     }).catch(() => {});
   }
 
-  socket.on('private-message', ({ toUserId, text }) => {
-    if (!text || !text.trim()) return;
-    text = text.trim().slice(0, 500);
-    pool.query('INSERT INTO messages (from_user_id, to_user_id, text) VALUES ($1, $2, $3) RETURNING id', [socket.userId, toUserId, text]).then(result => {
-      const msg = { id: result.rows[0].id, fromId: socket.userId, text, time: new Date().toISOString(), readAt: null };
+  socket.on('private-message', async ({ toUserId, text: msgText, replyToId }) => {
+    if (!msgText || !msgText.trim()) return;
+    const text = msgText.trim().slice(0, 500);
+    try {
+      const result = await pool.query('INSERT INTO messages (from_user_id, to_user_id, text, reply_to_id) VALUES ($1, $2, $3, $4) RETURNING id', [socket.userId, toUserId, text, replyToId || null]);
+      const msg = { id: result.rows[0].id, fromId: socket.userId, text, time: new Date().toISOString(), readAt: null, replyToId: replyToId || null };
+      if (replyToId) {
+        const rep = await pool.query('SELECT id, text, from_user_id as fromId FROM messages WHERE id = $1', [replyToId]);
+        if (rep.rows[0]) msg.replyTo = rep.rows[0];
+      }
       const target = [...onlineUsers.values()].find(u => u.id === toUserId);
       if (target) {
         io.to(target.socketId).emit('private-message', msg);
@@ -210,7 +295,7 @@ io.on('connection', (socket) => {
         }).catch(() => {});
       }
       socket.emit('private-message', msg);
-    }).catch(() => {});
+    } catch (e) {}
   });
 
   socket.on('mark-read', ({ fromUserId }) => {
