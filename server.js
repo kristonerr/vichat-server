@@ -200,7 +200,7 @@ io.on('connection', (socket) => {
     if (!text || !text.trim()) return;
     text = text.trim().slice(0, 500);
     const result = db.prepare('INSERT INTO messages (from_user_id, to_user_id, text) VALUES (?, ?, ?)').run(socket.userId, toUserId, text);
-    const msg = { id: result.lastInsertRowid, fromId: socket.userId, text, time: new Date().toLocaleString('ru-RU'), readAt: null };
+    const msg = { id: result.lastInsertRowid, fromId: socket.userId, text, time: new Date().toISOString(), readAt: null };
     const target = [...onlineUsers.values()].find(u => u.id === toUserId);
     if (target) {
       io.to(target.socketId).emit('private-message', msg);

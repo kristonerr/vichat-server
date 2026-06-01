@@ -287,7 +287,14 @@ function renderMessages(contactId) {
     div.appendChild(textSpan);
     const timeDiv = document.createElement('div');
     timeDiv.className = 'time';
-    timeDiv.textContent = m.time || '';
+    let timeStr = m.time || '';
+    try {
+      const d = new Date(timeStr.includes('T') ? timeStr : timeStr.replace(' ', 'T') + 'Z');
+      if (!isNaN(d.getTime())) {
+        timeStr = d.toLocaleString('ru-RU');
+      }
+    } catch (_) {}
+    timeDiv.textContent = timeStr;
     div.appendChild(timeDiv);
     el.appendChild(div);
   });
