@@ -4,7 +4,7 @@ const path = require('path');
 const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
-const db = require('./db');
+const { pool, initDB } = require('./db');
 
 const app = express();
 const server = http.createServer(app);
@@ -30,12 +30,12 @@ function checkRateLimit(ip, maxAttempts) {
   return null;
 }
 
-function getUserByToken(token) {
-  const row = db.prepare(`SELECT users.id, users.username, users.color FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = ?`).get(token);
-  return row || null;
+async function getUserByToken(token) {
+  const result = await pool.query(`SELECT users.id, users.username, users.color FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = $1`, [token]);
+  return result.rows[0] || null;
 }
 
-app.post('/api/register', (req, res) => {
+app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password || username.length < 2 || username.length > 20 || password.length < 4) {
     return res.status(400).json({ error: 'Имя от 2 до 20 символов, пароль от 4 символов' });
@@ -44,22 +44,23 @@ app.post('/api/register', (req, res) => {
   const wait = checkRateLimit(ip, 10);
   if (wait) return res.status(429).json({ error: `Слишком много попыток. Подожди ${wait} сек` });
 
-  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
-  if (existing) return res.status(409).json({ error: 'Имя уже занято' });
+  const existing = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+  if (existing.rows[0]) return res.status(409).json({ error: 'Имя уже занято' });
 
   const hash = bcrypt.hashSync(password, 10);
-  const color = colors[db.prepare('SELECT COUNT(*) as c FROM users').get().c % colors.length];
-  const result = db.prepare('INSERT INTO users (username, password_hash, color) VALUES (?, ?, ?)').run(username, hash, color);
+  const countResult = await pool.query('SELECT COUNT(*) as c FROM users');
+  const color = colors[parseInt(countResult.rows[0].c) % colors.length];
+  const newUser = await pool.query('INSERT INTO users (username, password_hash, color) VALUES ($1, $2, $3) RETURNING id', [username, hash, color]);
   const token = uuidv4();
-  db.prepare('INSERT INTO sessions (user_id, token) VALUES (?, ?)').run(result.lastInsertRowid, token);
+  await pool.query('INSERT INTO sessions (user_id, token) VALUES ($1, $2)', [newUser.rows[0].id, token]);
 
   const entry = authAttempts.get(ip);
   if (entry) entry.count = 0;
 
-  res.json({ token, user: { id: result.lastInsertRowid, username, color } });
+  res.json({ token, user: { id: newUser.rows[0].id, username, color } });
 });
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'Введите имя и пароль' });
 
@@ -67,7 +68,8 @@ app.post('/api/login', (req, res) => {
   const wait = checkRateLimit(ip, 5);
   if (wait) return res.status(429).json({ error: `Слишком много попыток. Подожди ${wait} сек` });
 
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+  const user = result.rows[0];
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
     const entry = authAttempts.get(ip) || { count: 0 };
     entry.count++;
@@ -77,52 +79,50 @@ app.post('/api/login', (req, res) => {
   }
 
   const token = uuidv4();
-  db.prepare('INSERT INTO sessions (user_id, token) VALUES (?, ?)').run(user.id, token);
+  await pool.query('INSERT INTO sessions (user_id, token) VALUES ($1, $2)', [user.id, token]);
   authAttempts.set(ip, { count: 0, lastAttempt: Date.now() });
 
   res.json({ token, user: { id: user.id, username: user.username, color: user.color } });
 });
 
-app.post('/api/logout', (req, res) => {
+app.post('/api/logout', async (req, res) => {
   const token = req.headers.authorization;
-  if (token) db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+  if (token) await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
   res.json({ ok: true });
 });
 
-app.get('/api/contacts', (req, res) => {
-  const user = getUserByToken(req.headers.authorization);
+app.get('/api/contacts', async (req, res) => {
+  const user = await getUserByToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'not authorized' });
-  const contacts = db.prepare(`
-    SELECT u.id, u.username, u.color,
-      (SELECT COUNT(*) FROM messages m WHERE m.from_user_id = u.id AND m.to_user_id = ? AND m.read_at IS NULL) as unread
-    FROM contacts c JOIN users u ON u.id = c.contact_id WHERE c.user_id = ?
-  `).all(user.id, user.id);
-  res.json(contacts);
+  const contacts = await pool.query(`SELECT u.id, u.username, u.color,
+    (SELECT COUNT(*) FROM messages m WHERE m.from_user_id = u.id AND m.to_user_id = $1 AND m.read_at IS NULL) as unread
+    FROM contacts c JOIN users u ON u.id = c.contact_id WHERE c.user_id = $2`, [user.id, user.id]);
+  res.json(contacts.rows);
 });
 
-app.post('/api/contacts/add', (req, res) => {
-  const user = getUserByToken(req.headers.authorization);
+app.post('/api/contacts/add', async (req, res) => {
+  const user = await getUserByToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'not authorized' });
-  const contact = db.prepare('SELECT id FROM users WHERE username = ?').get(req.body.username);
-  if (!contact) return res.status(404).json({ error: 'Пользователь не найден' });
-  if (contact.id === user.id) return res.status(400).json({ error: 'Нельзя добавить себя' });
+  const contact = await pool.query('SELECT id FROM users WHERE username = $1', [req.body.username]);
+  if (!contact.rows[0]) return res.status(404).json({ error: 'Пользователь не найден' });
+  if (contact.rows[0].id === user.id) return res.status(400).json({ error: 'Нельзя добавить себя' });
   try {
-    db.prepare('INSERT INTO contacts (user_id, contact_id) VALUES (?, ?)').run(user.id, contact.id);
-    res.json({ ok: true, contactId: contact.id });
+    await pool.query('INSERT INTO contacts (user_id, contact_id) VALUES ($1, $2)', [user.id, contact.rows[0].id]);
+    res.json({ ok: true, contactId: contact.rows[0].id });
   } catch (e) {
     res.status(409).json({ error: 'Уже в контактах' });
   }
 });
 
-app.post('/api/contacts/remove', (req, res) => {
-  const user = getUserByToken(req.headers.authorization);
+app.post('/api/contacts/remove', async (req, res) => {
+  const user = await getUserByToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'not authorized' });
-  db.prepare('DELETE FROM contacts WHERE user_id = ? AND contact_id = (SELECT id FROM users WHERE username = ?)').run(user.id, req.body.username);
+  await pool.query('DELETE FROM contacts WHERE user_id = $1 AND contact_id = (SELECT id FROM users WHERE username = $2)', [user.id, req.body.username]);
   res.json({ ok: true });
 });
 
-app.get('/api/me', (req, res) => {
-  const user = getUserByToken(req.headers.authorization);
+app.get('/api/me', async (req, res) => {
+  const user = await getUserByToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'not authorized' });
   res.json(user);
 });
@@ -133,51 +133,49 @@ app.get('/api/version', (req, res) => {
 
 app.use('/apk', express.static(path.join(__dirname, 'apk')));
 
-app.put('/api/messages/:id/edit', (req, res) => {
-  const user = getUserByToken(req.headers.authorization);
+app.put('/api/messages/:id/edit', async (req, res) => {
+  const user = await getUserByToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'not authorized' });
   const msgId = parseInt(req.params.id);
   const text = req.body.text?.trim().slice(0, 500);
   if (!text) return res.status(400).json({ error: 'text required' });
-  const msg = db.prepare('SELECT * FROM messages WHERE id = ?').get(msgId);
-  if (!msg) return res.status(404).json({ error: 'not found' });
-  if (msg.from_user_id !== user.id) return res.status(403).json({ error: 'not yours' });
-  db.prepare('UPDATE messages SET text = ? WHERE id = ?').run(text, msgId);
-  const target = [...onlineUsers.values()].find(u => u.id === msg.to_user_id);
+  const msg = await pool.query('SELECT * FROM messages WHERE id = $1', [msgId]);
+  if (!msg.rows[0]) return res.status(404).json({ error: 'not found' });
+  if (msg.rows[0].from_user_id !== user.id) return res.status(403).json({ error: 'not yours' });
+  await pool.query('UPDATE messages SET text = $1 WHERE id = $2', [text, msgId]);
+  const target = [...onlineUsers.values()].find(u => u.id === msg.rows[0].to_user_id);
   if (target) io.to(target.socketId).emit('message-edited', { id: msgId, text });
   res.json({ ok: true });
 });
 
-app.delete('/api/messages/:id', (req, res) => {
-  const user = getUserByToken(req.headers.authorization);
+app.delete('/api/messages/:id', async (req, res) => {
+  const user = await getUserByToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'not authorized' });
   const msgId = parseInt(req.params.id);
-  const msg = db.prepare('SELECT * FROM messages WHERE id = ?').get(msgId);
-  if (!msg) return res.status(404).json({ error: 'not found' });
-  if (msg.from_user_id !== user.id) return res.status(403).json({ error: 'not yours' });
-  db.prepare('DELETE FROM messages WHERE id = ?').run(msgId);
-  const target = [...onlineUsers.values()].find(u => u.id === msg.to_user_id);
+  const msg = await pool.query('SELECT * FROM messages WHERE id = $1', [msgId]);
+  if (!msg.rows[0]) return res.status(404).json({ error: 'not found' });
+  if (msg.rows[0].from_user_id !== user.id) return res.status(403).json({ error: 'not yours' });
+  await pool.query('DELETE FROM messages WHERE id = $1', [msgId]);
+  const target = [...onlineUsers.values()].find(u => u.id === msg.rows[0].to_user_id);
   if (target) io.to(target.socketId).emit('message-deleted', { id: msgId });
   res.json({ ok: true });
 });
 
-app.get('/api/messages/:contactId', (req, res) => {
-  const user = getUserByToken(req.headers.authorization);
+app.get('/api/messages/:contactId', async (req, res) => {
+  const user = await getUserByToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'not authorized' });
   const contactId = parseInt(req.params.contactId);
-  db.prepare('UPDATE messages SET read_at = datetime(\'now\') WHERE from_user_id = ? AND to_user_id = ? AND read_at IS NULL').run(contactId, user.id);
-  const msgs = db.prepare(`
-    SELECT m.id, m.text, m.from_user_id as fromId, m.created_at as time, m.read_at as readAt FROM messages m
-    WHERE (m.from_user_id = ? AND m.to_user_id = ?) OR (m.from_user_id = ? AND m.to_user_id = ?)
-    ORDER BY m.created_at ASC LIMIT 200
-  `).all(user.id, contactId, contactId, user.id);
-  res.json(msgs);
+  await pool.query('UPDATE messages SET read_at = NOW() WHERE from_user_id = $1 AND to_user_id = $2 AND read_at IS NULL', [contactId, user.id]);
+  const msgs = await pool.query(`SELECT m.id, m.text, m.from_user_id as fromId, m.created_at as time, m.read_at as readAt FROM messages m
+    WHERE (m.from_user_id = $1 AND m.to_user_id = $2) OR (m.from_user_id = $3 AND m.to_user_id = $4)
+    ORDER BY m.created_at ASC LIMIT 200`, [user.id, contactId, contactId, user.id]);
+  res.json(msgs.rows);
 });
 
-io.use((socket, next) => {
+io.use(async (socket, next) => {
   const token = socket.handshake.auth.token || socket.handshake.headers?.authorization || socket.handshake.query?.token;
   if (!token) return next(new Error('no token'));
-  const user = getUserByToken(token);
+  const user = await getUserByToken(token);
   if (!user) return next(new Error('invalid token'));
   socket.user = user;
   socket.userId = user.id;
@@ -188,38 +186,39 @@ io.on('connection', (socket) => {
   onlineUsers.set(socket.userId, { id: socket.userId, username: socket.user.username, color: socket.user.color, socketId: socket.id });
   broadcastContacts();
 
-  // Send pending offline messages
   const since = lastOnline.get(socket.userId) || 0;
   if (since) {
-    const sinceStr = new Date(since).toISOString().slice(0, 19).replace('T', ' ');
-    const pending = db.prepare(`
-      SELECT m.text, m.from_user_id as fromId, m.created_at as time FROM messages m
-      WHERE m.to_user_id = ? AND m.created_at > ?
-      ORDER BY m.created_at ASC
-    `).all(socket.userId, sinceStr);
-    for (const msg of pending) {
-      socket.emit('private-message', msg);
-    }
+    pool.query(`SELECT m.text, m.from_user_id as fromId, m.created_at as time FROM messages m
+      WHERE m.to_user_id = $1 AND m.created_at > to_timestamp($2)
+      ORDER BY m.created_at ASC`, [socket.userId, since / 1000]).then(result => {
+      for (const msg of result.rows) {
+        socket.emit('private-message', msg);
+      }
+    }).catch(() => {});
   }
 
   socket.on('private-message', ({ toUserId, text }) => {
     if (!text || !text.trim()) return;
     text = text.trim().slice(0, 500);
-    const result = db.prepare('INSERT INTO messages (from_user_id, to_user_id, text) VALUES (?, ?, ?)').run(socket.userId, toUserId, text);
-    const msg = { id: result.lastInsertRowid, fromId: socket.userId, text, time: new Date().toISOString(), readAt: null };
-    const target = [...onlineUsers.values()].find(u => u.id === toUserId);
-    if (target) {
-      io.to(target.socketId).emit('private-message', msg);
-      const unreadCount = db.prepare('SELECT COUNT(*) as c FROM messages WHERE from_user_id = ? AND to_user_id = ? AND read_at IS NULL').get(socket.userId, toUserId);
-      io.to(target.socketId).emit('unread-update', { fromUserId: socket.userId, count: unreadCount.c });
-    }
-    socket.emit('private-message', msg);
+    pool.query('INSERT INTO messages (from_user_id, to_user_id, text) VALUES ($1, $2, $3) RETURNING id', [socket.userId, toUserId, text]).then(result => {
+      const msg = { id: result.rows[0].id, fromId: socket.userId, text, time: new Date().toISOString(), readAt: null };
+      const target = [...onlineUsers.values()].find(u => u.id === toUserId);
+      if (target) {
+        io.to(target.socketId).emit('private-message', msg);
+        pool.query('SELECT COUNT(*) as c FROM messages WHERE from_user_id = $1 AND to_user_id = $2 AND read_at IS NULL', [socket.userId, toUserId]).then(r => {
+          io.to(target.socketId).emit('unread-update', { fromUserId: socket.userId, count: parseInt(r.rows[0].c) });
+        }).catch(() => {});
+      }
+      socket.emit('private-message', msg);
+    }).catch(() => {});
   });
 
   socket.on('mark-read', ({ fromUserId }) => {
-    db.prepare('UPDATE messages SET read_at = datetime(\'now\') WHERE from_user_id = ? AND to_user_id = ? AND read_at IS NULL').run(fromUserId, socket.userId);
-    const remaining = db.prepare('SELECT COUNT(*) as c FROM messages WHERE from_user_id = ? AND to_user_id = ? AND read_at IS NULL').get(fromUserId, socket.userId);
-    socket.emit('unread-update', { fromUserId, count: remaining.c });
+    pool.query('UPDATE messages SET read_at = NOW() WHERE from_user_id = $1 AND to_user_id = $2 AND read_at IS NULL', [fromUserId, socket.userId]).then(() => {
+      pool.query('SELECT COUNT(*) as c FROM messages WHERE from_user_id = $1 AND to_user_id = $2 AND read_at IS NULL', [fromUserId, socket.userId]).then(r => {
+        socket.emit('unread-update', { fromUserId, count: parseInt(r.rows[0].c) });
+      }).catch(() => {});
+    }).catch(() => {});
   });
 
   socket.on('typing', ({ toUserId }) => {
@@ -245,6 +244,12 @@ function broadcastContacts() {
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`ViChat on http://localhost:${PORT}`);
+
+initDB().then(() => {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`ViChat on http://localhost:${PORT}`);
+  });
+}).catch(err => {
+  console.error('DB init failed:', err);
+  process.exit(1);
 });
