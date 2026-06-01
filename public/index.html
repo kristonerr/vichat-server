@@ -276,9 +276,19 @@ function renderMessages(contactId) {
     const div = document.createElement('div');
     div.className = `msg ${isSelf ? 'self' : 'other'}`;
     if (!isSelf && contacts[contactId]) {
-      div.innerHTML = `<div class="uname" style="color:${contacts[contactId].color}">${contacts[contactId].username}</div>`;
+      const nameDiv = document.createElement('div');
+    nameDiv.className = 'uname';
+    nameDiv.style.color = contacts[contactId].color;
+    nameDiv.textContent = contacts[contactId].username;
+    div.appendChild(nameDiv);
     }
-    div.innerHTML += `${m.text}<div class="time">${m.time || ''}</div>`;
+    const textSpan = document.createElement('span');
+    textSpan.textContent = m.text;
+    div.appendChild(textSpan);
+    const timeDiv = document.createElement('div');
+    timeDiv.className = 'time';
+    timeDiv.textContent = m.time || '';
+    div.appendChild(timeDiv);
     el.appendChild(div);
   });
   el.scrollTop = el.scrollHeight;
