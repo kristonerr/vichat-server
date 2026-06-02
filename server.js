@@ -192,7 +192,7 @@ app.get('/api/avatar/:userId', async (req, res) => {
 
 app.get('/api/version', (req, res) => {
   const base = `${req.protocol}://${req.get('host')}`;
-  res.json({ versionCode: 14, versionName: '0.6.2', apkUrl: `${base}/apk/vichat.apk`, changelog: '- Автоустановка: уведомление + попытка открыть сразу\n- Улучшен UI' });
+  res.json({ versionCode: 15, versionName: '0.6.3', apkUrl: `${base}/apk/vichat.apk`, changelog: '- Исправлено: диалог настроек больше не перекрывает окно обновления\n- Автоустановка: уведомление + попытка открыть сразу' });
 });
 
 app.use('/apk', express.static(path.join(__dirname, 'apk')));
