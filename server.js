@@ -192,7 +192,7 @@ app.get('/api/avatar/:userId', async (req, res) => {
 
 app.get('/api/version', (req, res) => {
   const base = `${req.protocol}://${req.get('host')}`;
-  res.json({ versionCode: 17, versionName: '0.7.1', apkUrl: `${base}/apk/vichat.apk`, changelog: '- 4 цветовые схемы: сине-фиолетовая, чёрно-золотая, фиолетово-розовая, изумрудная\n- Селектор темы в настройках (⚙️)' });
+  res.json({ versionCode: 17, versionName: '0.7.1', apkUrl: `${base}/apk/vichat.apk`, changelog: '- Исправлено: уведомления больше не приходят на свои сообщения\n- Удалять AI-сообщения теперь могут оба участника чата\n- Личный режим: bridge с очередью для моих ответов' });
 });
 
 app.use('/apk', express.static(path.join(__dirname, 'apk')));
@@ -218,7 +218,7 @@ app.delete('/api/messages/:id', async (req, res) => {
   const msgId = parseInt(req.params.id);
   const msg = await pool.query('SELECT * FROM messages WHERE id = $1', [msgId]);
   if (!msg.rows[0]) return res.status(404).json({ error: 'not found' });
-  if (msg.rows[0].from_user_id !== user.id) return res.status(403).json({ error: 'not yours' });
+  if (msg.rows[0].from_user_id !== user.id && msg.rows[0].to_user_id !== user.id) return res.status(403).json({ error: 'not yours' });
   await pool.query('DELETE FROM messages WHERE id = $1', [msgId]);
   const target = [...onlineUsers.values()].find(u => u.id === msg.rows[0].to_user_id);
   if (target) io.to(target.socketId).emit('message-deleted', { id: msgId });
