@@ -6,6 +6,14 @@ const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
 const { pool, initDB } = require('./db');
+const fs = require('fs');
+const crypto = require('crypto');
+let logger;
+try {
+  logger = require('pino')({ level: 'info' });
+} catch (e) {
+  logger = { info: () => {}, warn: () => {}, error: () => {} };
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -18,6 +26,18 @@ const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96E6A1', '#DDA0DD', '#FFD93D'
 const authAttempts = new Map();
 const onlineUsers = new Map();
 const lastOnline = new Map();
+
+let apkHash = '';
+function computeApkHash() {
+  const apkPath = path.join(__dirname, 'apk', 'vichat.apk');
+  try {
+    apkHash = crypto.createHash('sha256').update(fs.readFileSync(apkPath)).digest('hex');
+    logger.info({ apkHash }, 'APK hash computed');
+  } catch (e) {
+    logger.warn('APK file not found, hash unavailable');
+  }
+}
+computeApkHash();
 
 const avatarStorage = multer.diskStorage({
   destination: path.join(__dirname, 'avatars'),
@@ -111,6 +131,20 @@ app.get('/api/contacts', async (req, res) => {
   res.json(rows);
 });
 
+app.post('/api/friend-request', async (req, res) => {
+  const user = await getUserByToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'not authorized' });
+  const contact = await pool.query('SELECT id, username, color, avatar_url FROM users WHERE username = $1', [req.body.username]);
+  if (!contact.rows[0]) return res.status(404).json({ error: 'Пользователь не найден' });
+  if (contact.rows[0].id === user.id) return res.status(400).json({ error: 'Нельзя добавить себя' });
+  try {
+    await pool.query('INSERT INTO contacts (user_id, contact_id) VALUES ($1, $2)', [user.id, contact.rows[0].id]);
+    res.json({ ok: true, contactId: contact.rows[0].id });
+  } catch (e) {
+    res.status(409).json({ error: 'Уже в контактах' });
+  }
+});
+
 app.post('/api/contacts/add', async (req, res) => {
   const user = await getUserByToken(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'not authorized' });
@@ -192,7 +226,7 @@ app.get('/api/avatar/:userId', async (req, res) => {
 
 app.get('/api/version', (req, res) => {
   const base = `${req.protocol}://${req.get('host')}`;
-  res.json({ versionCode: 17, versionName: '0.7.1', apkUrl: `${base}/apk/vichat.apk`, changelog: '- Исправлено: уведомления больше не приходят на свои сообщения\n- Удалять AI-сообщения теперь могут оба участника чата\n- Личный режим: bridge с очередью для моих ответов' });
+  res.json({ versionCode: 17, versionName: '0.7.1', apkUrl: `${base}/apk/vichat.apk`, apkHash, changelog: '- Исправлено: уведомления больше не приходят на свои сообщения\n- Удалять AI-сообщения теперь могут оба участника чата\n- Личный режим: bridge с очередью для моих ответов' });
 });
 
 app.use('/apk', express.static(path.join(__dirname, 'apk')));
@@ -207,8 +241,7 @@ app.put('/api/messages/:id/edit', async (req, res) => {
   if (!msg.rows[0]) return res.status(404).json({ error: 'not found' });
   if (msg.rows[0].from_user_id !== user.id) return res.status(403).json({ error: 'not yours' });
   await pool.query('UPDATE messages SET text = $1 WHERE id = $2', [text, msgId]);
-  const target = [...onlineUsers.values()].find(u => u.id === msg.rows[0].to_user_id);
-  if (target) io.to(target.socketId).emit('message-edited', { id: msgId, text });
+  io.to(msg.rows[0].to_user_id.toString()).emit('message-edited', { id: msgId, text });
   res.json({ ok: true });
 });
 
@@ -220,8 +253,8 @@ app.delete('/api/messages/:id', async (req, res) => {
   if (!msg.rows[0]) return res.status(404).json({ error: 'not found' });
   if (msg.rows[0].from_user_id !== user.id && msg.rows[0].to_user_id !== user.id) return res.status(403).json({ error: 'not yours' });
   await pool.query('DELETE FROM messages WHERE id = $1', [msgId]);
-  const target = [...onlineUsers.values()].find(u => u.id === msg.rows[0].to_user_id);
-  if (target) io.to(target.socketId).emit('message-deleted', { id: msgId });
+  io.to(msg.rows[0].from_user_id.toString()).emit('message-deleted', { id: msgId });
+  io.to(msg.rows[0].to_user_id.toString()).emit('message-deleted', { id: msgId });
   res.json({ ok: true });
 });
 
@@ -259,6 +292,8 @@ io.use(async (socket, next) => {
 });
 
 io.on('connection', (socket) => {
+  socket.join(socket.userId.toString());
+  logger.info({ userId: socket.userId, username: socket.user.username }, 'user connected');
   onlineUsers.set(socket.userId, { id: socket.userId, username: socket.user.username, color: socket.user.color, socketId: socket.id });
   broadcastContacts();
 
@@ -287,13 +322,10 @@ io.on('connection', (socket) => {
         const rep = await pool.query('SELECT id, text, from_user_id as fromId FROM messages WHERE id = $1', [replyToId]);
         if (rep.rows[0]) msg.replyTo = rep.rows[0];
       }
-      const target = [...onlineUsers.values()].find(u => u.id === toUserId);
-      if (target) {
-        io.to(target.socketId).emit('private-message', msg);
-        pool.query('SELECT COUNT(*) as c FROM messages WHERE from_user_id = $1 AND to_user_id = $2 AND read_at IS NULL', [socket.userId, toUserId]).then(r => {
-          io.to(target.socketId).emit('unread-update', { fromUserId: socket.userId, count: parseInt(r.rows[0].c) });
-        }).catch(() => {});
-      }
+      io.to(toUserId.toString()).emit('private-message', msg);
+      pool.query('SELECT COUNT(*) as c FROM messages WHERE from_user_id = $1 AND to_user_id = $2 AND read_at IS NULL', [socket.userId, toUserId]).then(r => {
+        io.to(toUserId.toString()).emit('unread-update', { fromUserId: socket.userId, count: parseInt(r.rows[0].c) });
+      }).catch(() => {});
       socket.emit('private-message', msg);
     } catch (e) {}
   });
@@ -307,18 +339,18 @@ io.on('connection', (socket) => {
   });
 
   socket.on('typing', ({ toUserId }) => {
-    const target = [...onlineUsers.values()].find(u => u.id === toUserId);
-    if (target) io.to(target.socketId).emit('typing', { fromUsername: socket.user.username });
+    io.to(toUserId.toString()).emit('typing', { fromUsername: socket.user.username });
   });
 
   socket.on('stop-typing', ({ toUserId }) => {
-    const target = [...onlineUsers.values()].find(u => u.id === toUserId);
-    if (target) io.to(target.socketId).emit('stop-typing');
+    io.to(toUserId.toString()).emit('stop-typing');
   });
 
   socket.on('disconnect', () => {
+    socket.leave(socket.userId.toString());
     lastOnline.set(socket.userId, Date.now());
     onlineUsers.delete(socket.userId);
+    logger.info({ userId: socket.userId }, 'user disconnected');
     broadcastContacts();
   });
 });
