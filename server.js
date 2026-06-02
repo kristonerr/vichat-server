@@ -192,7 +192,7 @@ app.get('/api/avatar/:userId', async (req, res) => {
 
 app.get('/api/version', (req, res) => {
   const base = `${req.protocol}://${req.get('host')}`;
-  res.json({ versionCode: 12, versionName: '0.6.0', apkUrl: `${base}/apk/vichat.apk`, changelog: '- Аватарки\n- Ответ на сообщения (reply)\n- Смена пароля\n- Удаление аккаунта' });
+  res.json({ versionCode: 13, versionName: '0.6.1', apkUrl: `${base}/apk/vichat.apk`, changelog: '- Исправлено автообновление\n- Кнопки вынесены в настройки\n- Улучшен UI' });
 });
 
 app.use('/apk', express.static(path.join(__dirname, 'apk')));
