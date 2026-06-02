@@ -192,7 +192,7 @@ app.get('/api/avatar/:userId', async (req, res) => {
 
 app.get('/api/version', (req, res) => {
   const base = `${req.protocol}://${req.get('host')}`;
-  res.json({ versionCode: 16, versionName: '0.7.0', apkUrl: `${base}/apk/vichat.apk`, changelog: '- 4 цветовые схемы: сине-фиолетовая, чёрно-золотая, фиолетово-розовая, изумрудная\n- Селектор темы в настройках (⚙️)' });
+  res.json({ versionCode: 17, versionName: '0.7.1', apkUrl: `${base}/apk/vichat.apk`, changelog: '- 4 цветовые схемы: сине-фиолетовая, чёрно-золотая, фиолетово-розовая, изумрудная\n- Селектор темы в настройках (⚙️)' });
 });
 
 app.use('/apk', express.static(path.join(__dirname, 'apk')));
