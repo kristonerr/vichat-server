@@ -5,15 +5,12 @@ const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
+const jwt = require('jsonwebtoken');
 const { pool, initDB } = require('./db');
 const fs = require('fs');
 const crypto = require('crypto');
 let logger;
-try {
-  logger = require('pino')({ level: 'info' });
-} catch (e) {
-  logger = { info: () => {}, warn: () => {}, error: () => {} };
-}
+try { logger = require('pino')({ level: 'info' }); } catch (e) { logger = { info: () => {}, warn: () => {}, error: () => {} }; }
 
 const app = express();
 const server = http.createServer(app);
@@ -22,6 +19,9 @@ const io = new Server(server, { cors: { origin: '*' } });
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+const JWT_SECRET = process.env.JWT_SECRET || 'vika-dev-secret-change-me';
+const ACCESS_EXPIRY = '15m';
+const BCRYPT_ROUNDS = 12;
 const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96E6A1', '#DDA0DD', '#FFD93D', '#FF8C42', '#6C5CE7'];
 const authAttempts = new Map();
 const onlineUsers = new Map();
@@ -30,21 +30,13 @@ const lastOnline = new Map();
 let apkHash = '';
 function computeApkHash() {
   const apkPath = path.join(__dirname, 'apk', 'vichat.apk');
-  try {
-    apkHash = crypto.createHash('sha256').update(fs.readFileSync(apkPath)).digest('hex');
-    logger.info({ apkHash }, 'APK hash computed');
-  } catch (e) {
-    logger.warn('APK file not found, hash unavailable');
-  }
+  try { apkHash = crypto.createHash('sha256').update(fs.readFileSync(apkPath)).digest('hex'); logger.info({ apkHash }, 'APK hash computed'); } catch (e) { logger.warn('APK file not found, hash unavailable'); }
 }
 computeApkHash();
 
 const avatarStorage = multer.diskStorage({
   destination: path.join(__dirname, 'avatars'),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.jpg';
-    cb(null, `${req.userId}${ext}`);
-  }
+  filename: (req, file, cb) => { const ext = path.extname(file.originalname) || '.jpg'; cb(null, `${req.userId}${ext}`); }
 });
 const upload = multer({ storage: avatarStorage, limits: { fileSize: 2 * 1024 * 1024 } });
 
@@ -60,158 +52,139 @@ function checkRateLimit(ip, maxAttempts) {
   return null;
 }
 
-async function getUserByToken(token) {
-  const result = await pool.query(`SELECT users.id, users.username, users.color, users.avatar_url FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = $1`, [token]);
-  return result.rows[0] || null;
+function authJWT(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'no token' });
+  try { req.userId = jwt.verify(auth, JWT_SECRET).userId; next(); }
+  catch (e) { res.status(401).json({ error: e.name === 'TokenExpiredError' ? 'token expired' : 'invalid token' }); }
+}
+
+async function getUserById(userId) {
+  const r = await pool.query('SELECT id, username, color, avatar_url FROM users WHERE id = $1', [userId]);
+  return r.rows[0] || null;
+}
+
+function makeToken(userId) {
+  return { accessToken: jwt.sign({ userId }, JWT_SECRET, { expiresIn: ACCESS_EXPIRY }), refreshToken: uuidv4() };
 }
 
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
-  if (!username || !password || username.length < 2 || username.length > 20 || password.length < 4) {
-    return res.status(400).json({ error: 'Имя от 2 до 20 символов, пароль от 4 символов' });
-  }
+  if (!username || !password || username.length < 2 || username.length > 20 || password.length < 4) return res.status(400).json({ error: 'Имя от 2 до 20 символов, пароль от 4 символов' });
   const ip = req.ip;
   const wait = checkRateLimit(ip, 10);
   if (wait) return res.status(429).json({ error: `Слишком много попыток. Подожди ${wait} сек` });
-
   const existing = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
   if (existing.rows[0]) return res.status(409).json({ error: 'Имя уже занято' });
-
-  const hash = bcrypt.hashSync(password, 10);
+  const hash = bcrypt.hashSync(password, BCRYPT_ROUNDS);
   const countResult = await pool.query('SELECT COUNT(*) as c FROM users');
   const color = colors[parseInt(countResult.rows[0].c) % colors.length];
   const newUser = await pool.query('INSERT INTO users (username, password_hash, color) VALUES ($1, $2, $3) RETURNING id', [username, hash, color]);
-  const token = uuidv4();
-  await pool.query('INSERT INTO sessions (user_id, token) VALUES ($1, $2)', [newUser.rows[0].id, token]);
-
-  const entry = authAttempts.get(ip);
-  if (entry) entry.count = 0;
-
-  res.json({ token, user: { id: newUser.rows[0].id, username, color, avatarUrl: null } });
+  const { accessToken, refreshToken } = makeToken(newUser.rows[0].id);
+  await pool.query('INSERT INTO sessions (user_id, token) VALUES ($1, $2)', [newUser.rows[0].id, refreshToken]);
+  const entry = authAttempts.get(ip); if (entry) entry.count = 0;
+  res.json({ accessToken, refreshToken, user: { id: newUser.rows[0].id, username, color, avatarUrl: null } });
 });
 
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'Введите имя и пароль' });
-
   const ip = req.ip;
   const wait = checkRateLimit(ip, 5);
   if (wait) return res.status(429).json({ error: `Слишком много попыток. Подожди ${wait} сек` });
-
   const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
   const user = result.rows[0];
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
-    const entry = authAttempts.get(ip) || { count: 0 };
-    entry.count++;
-    entry.lastAttempt = Date.now();
-    authAttempts.set(ip, entry);
+    const entry = authAttempts.get(ip) || { count: 0, lastAttempt: Date.now() }; entry.count++; entry.lastAttempt = Date.now(); authAttempts.set(ip, entry);
     return res.status(401).json({ error: 'Неверное имя или пароль' });
   }
-
-  const token = uuidv4();
-  await pool.query('INSERT INTO sessions (user_id, token) VALUES ($1, $2)', [user.id, token]);
+  const { accessToken, refreshToken } = makeToken(user.id);
+  await pool.query('INSERT INTO sessions (user_id, token) VALUES ($1, $2)', [user.id, refreshToken]);
   authAttempts.set(ip, { count: 0, lastAttempt: Date.now() });
+  res.json({ accessToken, refreshToken, user: { id: user.id, username: user.username, color: user.color, avatarUrl: user.avatar_url || null } });
+});
 
-  res.json({ token, user: { id: user.id, username: user.username, color: user.color, avatarUrl: user.avatar_url || null } });
+app.post('/api/refresh', async (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) return res.status(400).json({ error: 'refresh token required' });
+  const s = await pool.query('SELECT user_id FROM sessions WHERE token = $1', [refreshToken]);
+  if (!s.rows[0]) return res.status(401).json({ error: 'invalid refresh token' });
+  res.json({ accessToken: jwt.sign({ userId: s.rows[0].user_id }, JWT_SECRET, { expiresIn: ACCESS_EXPIRY }) });
 });
 
 app.post('/api/logout', async (req, res) => {
-  const token = req.headers.authorization;
-  if (token) await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
+  const { refreshToken } = req.body;
+  if (refreshToken) await pool.query('DELETE FROM sessions WHERE token = $1', [refreshToken]);
+  else {
+    const auth = req.headers.authorization;
+    if (auth) { try { const d = jwt.verify(auth, JWT_SECRET); await pool.query('DELETE FROM sessions WHERE user_id = $1', [d.userId]); } catch (e) {} }
+  }
   res.json({ ok: true });
 });
 
-app.get('/api/contacts', async (req, res) => {
-  const user = await getUserByToken(req.headers.authorization);
-  if (!user) return res.status(401).json({ error: 'not authorized' });
+app.get('/api/contacts', authJWT, async (req, res) => {
   const contacts = await pool.query(`SELECT u.id, u.username, u.color, u.avatar_url,
     (SELECT COUNT(*) FROM messages m WHERE m.from_user_id = u.id AND m.to_user_id = $1 AND m.read_at IS NULL) as unread
-    FROM contacts c JOIN users u ON u.id = c.contact_id WHERE c.user_id = $2`, [user.id, user.id]);
-  const rows = contacts.rows.map(r => ({ ...r, avatarUrl: r.avatar_url || null }));
-  res.json(rows);
+    FROM contacts c JOIN users u ON u.id = c.contact_id WHERE c.user_id = $2`, [req.userId, req.userId]);
+  res.json(contacts.rows.map(r => ({ ...r, avatarUrl: r.avatar_url || null })));
 });
 
-app.post('/api/friend-request', async (req, res) => {
-  const user = await getUserByToken(req.headers.authorization);
-  if (!user) return res.status(401).json({ error: 'not authorized' });
+app.post('/api/friend-request', authJWT, async (req, res) => {
   const contact = await pool.query('SELECT id, username, color, avatar_url FROM users WHERE username = $1', [req.body.username]);
   if (!contact.rows[0]) return res.status(404).json({ error: 'Пользователь не найден' });
-  if (contact.rows[0].id === user.id) return res.status(400).json({ error: 'Нельзя добавить себя' });
-  try {
-    await pool.query('INSERT INTO contacts (user_id, contact_id) VALUES ($1, $2)', [user.id, contact.rows[0].id]);
-    res.json({ ok: true, contactId: contact.rows[0].id });
-  } catch (e) {
-    res.status(409).json({ error: 'Уже в контактах' });
-  }
+  if (contact.rows[0].id === req.userId) return res.status(400).json({ error: 'Нельзя добавить себя' });
+  try { await pool.query('INSERT INTO contacts (user_id, contact_id) VALUES ($1, $2)', [req.userId, contact.rows[0].id]); res.json({ ok: true, contactId: contact.rows[0].id }); }
+  catch (e) { res.status(409).json({ error: 'Уже в контактах' }); }
 });
 
-app.post('/api/contacts/add', async (req, res) => {
-  const user = await getUserByToken(req.headers.authorization);
-  if (!user) return res.status(401).json({ error: 'not authorized' });
+app.post('/api/contacts/add', authJWT, async (req, res) => {
   const contact = await pool.query('SELECT id, username, color, avatar_url FROM users WHERE username = $1', [req.body.username]);
   if (!contact.rows[0]) return res.status(404).json({ error: 'Пользователь не найден' });
-  if (contact.rows[0].id === user.id) return res.status(400).json({ error: 'Нельзя добавить себя' });
-  try {
-    await pool.query('INSERT INTO contacts (user_id, contact_id) VALUES ($1, $2)', [user.id, contact.rows[0].id]);
-    res.json({ ok: true, contactId: contact.rows[0].id });
-  } catch (e) {
-    res.status(409).json({ error: 'Уже в контактах' });
-  }
+  if (contact.rows[0].id === req.userId) return res.status(400).json({ error: 'Нельзя добавить себя' });
+  try { await pool.query('INSERT INTO contacts (user_id, contact_id) VALUES ($1, $2)', [req.userId, contact.rows[0].id]); res.json({ ok: true, contactId: contact.rows[0].id }); }
+  catch (e) { res.status(409).json({ error: 'Уже в контактах' }); }
 });
 
-app.post('/api/contacts/remove', async (req, res) => {
-  const user = await getUserByToken(req.headers.authorization);
-  if (!user) return res.status(401).json({ error: 'not authorized' });
-  await pool.query('DELETE FROM contacts WHERE user_id = $1 AND contact_id = (SELECT id FROM users WHERE username = $2)', [user.id, req.body.username]);
+app.post('/api/contacts/remove', authJWT, async (req, res) => {
+  await pool.query('DELETE FROM contacts WHERE user_id = $1 AND contact_id = (SELECT id FROM users WHERE username = $2)', [req.userId, req.body.username]);
   res.json({ ok: true });
 });
 
-app.get('/api/me', async (req, res) => {
-  const user = await getUserByToken(req.headers.authorization);
-  if (!user) return res.status(401).json({ error: 'not authorized' });
+app.get('/api/me', authJWT, async (req, res) => {
+  const user = await getUserById(req.userId);
+  if (!user) return res.status(404).json({ error: 'user not found' });
   res.json({ ...user, avatarUrl: user.avatar_url || null });
 });
 
-app.post('/api/change-password', async (req, res) => {
-  const user = await getUserByToken(req.headers.authorization);
-  if (!user) return res.status(401).json({ error: 'not authorized' });
+app.post('/api/change-password', authJWT, async (req, res) => {
   const { oldPassword, newPassword } = req.body;
-  if (!oldPassword || !newPassword || newPassword.length < 4) {
-    return res.status(400).json({ error: 'Новый пароль от 4 символов' });
-  }
-  const fullUser = await pool.query('SELECT * FROM users WHERE id = $1', [user.id]);
-  if (!bcrypt.compareSync(oldPassword, fullUser.rows[0].password_hash)) {
-    return res.status(403).json({ error: 'Неверный текущий пароль' });
-  }
-  const hash = bcrypt.hashSync(newPassword, 10);
-  await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, user.id]);
+  if (!oldPassword || !newPassword || newPassword.length < 4) return res.status(400).json({ error: 'Новый пароль от 4 символов' });
+  const fullUser = await pool.query('SELECT * FROM users WHERE id = $1', [req.userId]);
+  if (!bcrypt.compareSync(oldPassword, fullUser.rows[0].password_hash)) return res.status(403).json({ error: 'Неверный текущий пароль' });
+  await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [bcrypt.hashSync(newPassword, BCRYPT_ROUNDS), req.userId]);
   res.json({ ok: true });
 });
 
 app.delete('/api/account', async (req, res) => {
-  const token = req.headers.authorization;
-  const user = await getUserByToken(token);
-  if (!user) return res.status(401).json({ error: 'not authorized' });
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'no token' });
+  let userId;
+  try { userId = jwt.verify(auth, JWT_SECRET).userId; } catch (e) { return res.status(401).json({ error: 'token expired' }); }
   const { password } = req.body;
   if (!password) return res.status(400).json({ error: 'Введите пароль для подтверждения' });
-  const fullUser = await pool.query('SELECT * FROM users WHERE id = $1', [user.id]);
-  if (!bcrypt.compareSync(password, fullUser.rows[0].password_hash)) {
-    return res.status(403).json({ error: 'Неверный пароль' });
-  }
-  await pool.query('DELETE FROM sessions WHERE user_id = $1', [user.id]);
-  await pool.query('DELETE FROM users WHERE id = $1', [user.id]);
+  const fullUser = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+  if (!bcrypt.compareSync(password, fullUser.rows[0].password_hash)) return res.status(403).json({ error: 'Неверный пароль' });
+  await pool.query('DELETE FROM sessions WHERE user_id = $1', [userId]);
+  await pool.query('DELETE FROM users WHERE id = $1', [userId]);
   res.json({ ok: true });
 });
 
-app.post('/api/upload-avatar', async (req, res) => {
-  const user = await getUserByToken(req.headers.authorization);
-  if (!user) return res.status(401).json({ error: 'not authorized' });
-  req.userId = user.id;
+app.post('/api/upload-avatar', authJWT, async (req, res) => {
   upload.single('avatar')(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.message });
     if (!req.file) return res.status(400).json({ error: 'Файл не загружен' });
-    const avatarUrl = `/api/avatar/${user.id}${path.extname(req.file.originalname) || '.jpg'}`;
-    await pool.query('UPDATE users SET avatar_url = $1 WHERE id = $2', [avatarUrl, user.id]);
+    const avatarUrl = `/api/avatar/${req.userId}${path.extname(req.file.originalname) || '.jpg'}`;
+    await pool.query('UPDATE users SET avatar_url = $1 WHERE id = $2', [avatarUrl, req.userId]);
     res.json({ avatarUrl });
   });
 });
@@ -226,57 +199,47 @@ app.get('/api/avatar/:userId', async (req, res) => {
 
 app.get('/api/version', (req, res) => {
   const base = `${req.protocol}://${req.get('host')}`;
-  res.json({ versionCode: 17, versionName: '0.7.1', apkUrl: `${base}/apk/vichat.apk`, apkHash, changelog: '- Исправлено: уведомления больше не приходят на свои сообщения\n- Удалять AI-сообщения теперь могут оба участника чата\n- Личный режим: bridge с очередью для моих ответов' });
+  res.json({ versionCode: 18, versionName: '0.8.0', apkUrl: `${base}/apk/vichat.apk`, apkHash, changelog: '- JWT-авторизация: accessToken + refreshToken\n- Авто-рефреш токена на Android\n- SHA-256 проверка APK перед установкой\n- Оптимизация сервера' });
 });
 
 app.use('/apk', express.static(path.join(__dirname, 'apk')));
 
-app.put('/api/messages/:id/edit', async (req, res) => {
-  const user = await getUserByToken(req.headers.authorization);
-  if (!user) return res.status(401).json({ error: 'not authorized' });
+app.put('/api/messages/:id/edit', authJWT, async (req, res) => {
   const msgId = parseInt(req.params.id);
   const text = req.body.text?.trim().slice(0, 500);
   if (!text) return res.status(400).json({ error: 'text required' });
   const msg = await pool.query('SELECT * FROM messages WHERE id = $1', [msgId]);
   if (!msg.rows[0]) return res.status(404).json({ error: 'not found' });
-  if (msg.rows[0].from_user_id !== user.id) return res.status(403).json({ error: 'not yours' });
+  if (msg.rows[0].from_user_id !== req.userId) return res.status(403).json({ error: 'not yours' });
   await pool.query('UPDATE messages SET text = $1 WHERE id = $2', [text, msgId]);
   io.to(msg.rows[0].to_user_id.toString()).emit('message-edited', { id: msgId, text });
   res.json({ ok: true });
 });
 
-app.delete('/api/messages/:id', async (req, res) => {
-  const user = await getUserByToken(req.headers.authorization);
-  if (!user) return res.status(401).json({ error: 'not authorized' });
+app.delete('/api/messages/:id', authJWT, async (req, res) => {
   const msgId = parseInt(req.params.id);
   const msg = await pool.query('SELECT * FROM messages WHERE id = $1', [msgId]);
   if (!msg.rows[0]) return res.status(404).json({ error: 'not found' });
-  if (msg.rows[0].from_user_id !== user.id && msg.rows[0].to_user_id !== user.id) return res.status(403).json({ error: 'not yours' });
+  if (msg.rows[0].from_user_id !== req.userId && msg.rows[0].to_user_id !== req.userId) return res.status(403).json({ error: 'not yours' });
   await pool.query('DELETE FROM messages WHERE id = $1', [msgId]);
   io.to(msg.rows[0].from_user_id.toString()).emit('message-deleted', { id: msgId });
   io.to(msg.rows[0].to_user_id.toString()).emit('message-deleted', { id: msgId });
   res.json({ ok: true });
 });
 
-app.get('/api/messages/:contactId', async (req, res) => {
-  const user = await getUserByToken(req.headers.authorization);
-  if (!user) return res.status(401).json({ error: 'not authorized' });
+app.get('/api/messages/:contactId', authJWT, async (req, res) => {
   const contactId = parseInt(req.params.contactId);
-  await pool.query('UPDATE messages SET read_at = NOW() WHERE from_user_id = $1 AND to_user_id = $2 AND read_at IS NULL', [contactId, user.id]);
+  await pool.query('UPDATE messages SET read_at = NOW() WHERE from_user_id = $1 AND to_user_id = $2 AND read_at IS NULL', [contactId, req.userId]);
   const msgs = await pool.query(`SELECT m.id, m.text, m.from_user_id as fromId, m.created_at as time, m.read_at as readAt, m.reply_to_id as replyToId FROM messages m
     WHERE (m.from_user_id = $1 AND m.to_user_id = $2) OR (m.from_user_id = $3 AND m.to_user_id = $4)
-    ORDER BY m.created_at ASC LIMIT 200`, [user.id, contactId, contactId, user.id]);
+    ORDER BY m.created_at ASC LIMIT 200`, [req.userId, contactId, contactId, req.userId]);
   const rows = msgs.rows;
   const replyIds = rows.filter(r => r.replyToId).map(r => r.replyToId);
   if (replyIds.length > 0) {
     const replied = await pool.query('SELECT id, text, from_user_id as fromId FROM messages WHERE id = ANY($1::int[])', [replyIds]);
     const replyMap = {};
     for (const r of replied.rows) replyMap[r.id] = r;
-    for (const row of rows) {
-      if (row.replyToId && replyMap[row.replyToId]) {
-        row.replyTo = replyMap[row.replyToId];
-      }
-    }
+    for (const row of rows) { if (row.replyToId && replyMap[row.replyToId]) row.replyTo = replyMap[row.replyToId]; }
   }
   res.json(rows);
 });
@@ -284,11 +247,16 @@ app.get('/api/messages/:contactId', async (req, res) => {
 io.use(async (socket, next) => {
   const token = socket.handshake.auth.token || socket.handshake.headers?.authorization || socket.handshake.query?.token;
   if (!token) return next(new Error('no token'));
-  const user = await getUserByToken(token);
-  if (!user) return next(new Error('invalid token'));
-  socket.user = user;
-  socket.userId = user.id;
-  next();
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await getUserById(decoded.userId);
+    if (!user) return next(new Error('user not found'));
+    socket.user = user; socket.userId = user.id; next();
+  } catch (e) {
+    const r = await pool.query('SELECT users.id, users.username, users.color, users.avatar_url FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = $1', [token]);
+    if (!r.rows[0]) return next(new Error('invalid token'));
+    socket.user = r.rows[0]; socket.userId = r.rows[0].id; next();
+  }
 });
 
 io.on('connection', (socket) => {
